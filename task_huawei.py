@@ -477,7 +477,7 @@ def run_analytics(N, df_sample):
         print(f"Максимум: {np.max(decode_times):.4f} сек")
 
     # Базовая логика рекомендаций
-    print("\n--- РЕКОМЕНДАЦИИ  ---")
+    print("\n--- РЕКОМЕНДАЦИИ  --")
     if fail_rate == 0:
         print("Система работает идеально. Ресурсов достаточно.")
     else:
