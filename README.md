@@ -1,12 +1,12 @@
 ### Huawei LLM Inference Tasks
 This repository contains the solutions for the Huawei LMM Inference Optimization technical assignment. The project is divided into two main parts: a framework analysis and a custom discrete-event simulator for multi-modal inference.
 
-####Task 1: SGLang Framework Analysis
+#### Task 1: SGLang Framework Analysis
 I have thoroughly read the SGLang paper (RadixAttention and frontend language optimizations) and prepared a structured summary.
 
 To go beyond just theory, I have installed the SGLang framework locally and successfully ran several inference examples. I've explored how it handles structured generation and state sharing. I am ready to discuss the paper's core concepts, my hands-on experience, and show the code examples during the technical interview.
 
-####Task 2: Multi-Modal LLM Inference Simulator
+#### Task 2: Multi-Modal LLM Inference Simulator
 The core task was to simulate a server handling multi-modal requests (text + images) based on Azure traces, and find the minimum number of GPUs (N) required without violating strict SLA limits (TTFT <= 10s, Decode <= 1s).
 
 The Evolution (How it started vs. How it's going)
