@@ -1,9 +1,24 @@
+!wget -O trace.csv.gz https://github.com/Azure/AzurePublicDataset/raw/master/data/AzureLMMInferenceTrace_multimodal.csv.gz
+
+
 import heapq
 import math
 from collections import deque
+from typing import List, Deque, Optional
 
 import numpy as np
 import pandas as pd
+
+# ================================
+'''
+Ниже представлен код симуляции работы программы, которая на основе логов подбирает 
+необходимое количество ГПУ для работы с такими запросами. 
+В этом файле сосредочился
+на корректном написании кода, его оформлении, описании работы функций, типизации.
+В файле min_gpu_for_azure_logs.ipynb код ниже будет переиспользоваться
+и в том же файле будет ответ на задачу сколько гпу + аналитика логов и подбор параметров
+'''
+# =================================
 
 # gzip по расширению
 df = pd.read_csv("trace.csv.gz", compression="gzip")
@@ -48,7 +63,7 @@ class Request:
 
     """
 
-    def __init__(self, id, time_to_come, token_context, num_images, token_generation):
+    def __init__(self, id: int, time_to_come: float, token_context: int, num_images: int, token_generation: int):
         self.id = id
         self.time_to_come = time_to_come
         self.num_images = num_images
@@ -56,22 +71,21 @@ class Request:
         self.token_generation = token_generation
 
         # данные симуляции
-        self.start_processing_time = None
-        self.ttft_time = None
+        self.start_processing_time: Optional[float] = None
+        self.ttft_time: Optional[float] = None
 
         self.images_left = self.num_images
+        self.images_processed = False  # Флаг обработки изображений
         self.context_tokens_left = self.token_context
-        self.tokens_left_to_generate = (
-            self.token_generation
-        )  # сколько осталось генерить
+        self.tokens_left_to_generate = self.token_generation  # сколько осталось генерить
         self.allocated_vram = 0  # сколько памяти запрос схавал
 
-        self.finish_time = None
+        self.finish_time: Optional[float] = None
         self.limit_failed = False
-        self.time_stage_3 = None
-        self.fail_reason = None
+        self.time_stage_3: Optional[float] = None
+        self.fail_reason: Optional[str] = None
 
-    def get_memory_per_request(self):
+    def get_memory_per_request(self) -> int:
         """
         сколько инпут займет памяти VRAM
         для картинки, контекстов, генераций
@@ -89,15 +103,14 @@ class Accelerator:
     статус (Свободен/Занят), доступная_память, вычислительная_мощность, номер_гпу
     """
 
-    def __init__(self, status, memory, computing, gpu_id):
+    def __init__(self, status: str, memory: int, computing: int, gpu_id: int):
         self.status = status
         self.free_memory = MEM_M
         self.computing = computing
-        self.active_batch = []  # наша VRAM
-        self.is_ticking = (
-            False  # это флаг того, что если загрузится гпу, то она в работе
-        )
+        self.active_batch: List[Request] = []  # наша VRAM
+        self.is_ticking = False  # это флаг того, что если загрузится гпу, то она в работе
         self.gpu_id = gpu_id
+        self.total_compute_time = 0.0
 
 
 class Event:
@@ -108,18 +121,18 @@ class Event:
     list_current_batch - лист всех нынешнего батча
     """
 
-    def __init__(self, time_event, type_event, data, list_current_batch=None):
+    def __init__(self, time_event: float, type_event: str, data, list_current_batch=None):
         self.time_event = time_event
         self.type_event = type_event
         self.data = data
         self.list_current_batch = list_current_batch
 
     # для сравнения событий через магическиий метода __less than__
-    def __lt__(self, other):
+    def __lt__(self, other) -> bool:
         return self.time_event < other.time_event
 
 
-def make_heap_from_df(df):
+def make_heap_from_df(df: pd.DataFrame) -> List[Event]:
 
     scheduler_event = []
     # берем сырой df
@@ -134,9 +147,7 @@ def make_heap_from_df(df):
     df.sort_values(by="TIMESTAMP", inplace=True)
 
     # из дата фрейма в инициализацию календаря
-    for row in df[
-        ["Arrival_Sec", "ContextTokens", "NumImages", "GeneratedTokens"]
-    ].itertuples():
+    for row in df[["Arrival_Sec", "ContextTokens", "NumImages", "GeneratedTokens"]].itertuples():
         req = Request(
             row.Index,
             row.Arrival_Sec,
@@ -153,10 +164,9 @@ def make_heap_from_df(df):
     return scheduler_event
 
 
-def check_limitations(req):
+def check_limitations(req: Request) -> None:
     """
     проверка sla с подробным логированием
-
     """
     ttft_duration = req.ttft_time - req.time_to_come
     average_time_per_token = 0.0
@@ -180,31 +190,12 @@ def check_limitations(req):
                 f" ----> [SLA FAILED] REQ {req.id}: ПРЕВЫШЕН ЛИМИТ ГЕНЕРАЦИИ НА ТОКЕН"
             )
 
-
-"""
-15 march динамический KV-CACHE + CB + CHUNKED PREFILL
-512 токенов это sweet spot для A100/H100 и не нагружает ядра гпу чтобы
-другие пользователи не заметили разницы в задержке response
-но можно и больше - это гиперпараметр
-"""
-
-"""
-17 марта чиню багу на sla
-upd оказалось неправильно рассчитывал эвристику параллелизма
-поэтому всегда вываливалось за лимиты и помогли логи
-
-18 марта ошибка после 701 deadlock - была утечка призрачной памяти
-нужно чтоб req не был в active_batch
-
-получился рабочий код при не щадящих ограничених 
-потом код ложился на определенных логах, где generatedcontext == 0
-"""
-
-
-def scheduler_step(
-    time_now, deque_requests, accelerator, scheduler_event, completed_requests
-):
-
+def collect_finished_requests(time_now: float, accelerator: Accelerator, completed_requests: List[Request]) -> None:
+    """
+    Очищает активный батч от полностью сгенерированных запросов и освобождает память.
+    Переменные: time_now (текущее время), accelerator (текущая GPU), completed_requests (список готовых запросов).
+    Идеи: Высвобождение KV-Cache. Как только запрос полностью сгенерирован, память немедленно возвращается в пул (free_memory) для других задач.
+    """
     finished_requests = []
 
     for req in accelerator.active_batch:
@@ -221,9 +212,16 @@ def scheduler_step(
         req for req in accelerator.active_batch if req not in finished_set
     ]
 
-    # Дозаполнение батча (Continuous Batching)
+
+def admit_new_requests(deque_requests: Deque[Request], accelerator: Accelerator) -> None:
+    """
+    Забирает новые запросы из очереди ожидания в активный батч, если хватает VRAM.
+    Переменные: deque_requests (очередь ожидания), accelerator (текущая GPU).
+    Тут Continuous Batching. Запросы добавляются в батч динамически "на лету", не дожидаясь,
+     пока все предыдущие запросы закончат окончательную генерацию.
+    """
     while deque_requests:
-        # --- ПРЕДОХРАНИТЕЛЬ: Ограничение  батча ---
+        # Ограничение  батча потому что жадник барагозит
         if len(accelerator.active_batch) >= MAX_BATCH_SIZE:
             break
 
@@ -250,15 +248,42 @@ def scheduler_step(
 
             # Обнуляем картинки, так как память под них выделена
             req.images_left = 0
-            # req.context_tokens_left -= tokens_for_first_chunk
         else:
             break
 
-    # Если батч пуст - выключаем GPU
-    if not accelerator.active_batch:
-        accelerator.is_ticking = False
-        return
 
+def evict_requests_if_oom(req: Request, accelerator: Accelerator, deque_requests: Deque[Request]) -> None:
+    """
+    Вытесняет запросы обратно в очередь, если памяти для генерации следующего токена недостаточно.
+    Переменные: req (текущий запрос декодера), accelerator (GPU), deque_requests (очередь ожидания).
+    Eviction Policy  защита от OOM. При нехватке памяти запрос leftappend к нашему буфера (деке)
+    """
+    while accelerator.free_memory < MEM_Z:
+        victim_req = max(
+            accelerator.active_batch, key=lambda r: r.tokens_left_to_generate
+        )
+        if victim_req is req:
+            break
+
+        accelerator.free_memory += victim_req.allocated_vram
+        victim_req.allocated_vram = 0
+        victim_req.context_tokens_left = victim_req.token_context
+        victim_req.ttft_time = None
+        victim_req.images_processed = False 
+        
+        accelerator.active_batch.remove(victim_req)
+        deque_requests.appendleft(victim_req)
+
+
+def process_compute_step(time_now: float, deque_requests: Deque[Request], accelerator: Accelerator, scheduler_event: List[Event]) -> None:
+    """
+    Выполняет математику фаз Prefill и Decode, вычисляет длительность такта и планирует следующий тик.
+    Переменные: time_now (текущее время), deque_requests (очередь), accelerator (GPU), scheduler_event (события).
+    Chunked Prefill
+    Заметил, что когда в батч к декодерам залетает жирный реквест на префилл, то батч
+    начинает тормозить сильно. Поэтому в батч отправляется кусочек MAX_CHUNK_SIZE 
+    который является параметром и я его вычисляю под определнный спек ГПУ в джупайтере
+    """
     #  Распределение на Newbies (Prefill) и Decoders (Генерация)
     newbies = [i for i in accelerator.active_batch if i.ttft_time is None]
     # Защита от "путешествий во времени" (запрос становится декодером только когда настало его время)
@@ -272,7 +297,7 @@ def scheduler_step(
     if newbies:
         for req in newbies:
             # Считаем картинки только один раз (когда контекст еще целый)
-            if getattr(req, "images_processed", False) is False:
+            if not req.images_processed:
                 current_images_to_process += req.num_images
                 req.images_processed = True
 
@@ -300,19 +325,7 @@ def scheduler_step(
         if req not in accelerator.active_batch:
             continue
 
-        while accelerator.free_memory < MEM_Z:
-            victim_req = max(
-                accelerator.active_batch, key=lambda r: r.tokens_left_to_generate
-            )
-            if victim_req is req:
-                break
-
-            accelerator.free_memory += victim_req.allocated_vram
-            victim_req.allocated_vram = 0
-            victim_req.context_tokens_left = victim_req.token_context
-            victim_req.ttft_time = None
-            accelerator.active_batch.remove(victim_req)
-            deque_requests.appendleft(victim_req)
+        evict_requests_if_oom(req, accelerator, deque_requests)
 
         if accelerator.free_memory >= MEM_Z:
             req.tokens_left_to_generate -= 1
@@ -338,6 +351,9 @@ def scheduler_step(
     if step_time <= 0:
         step_time = 0.001
 
+    # подсчет полезной работы
+    accelerator.total_compute_time += step_time
+
     # Назначаем TTFT тем, кто закончил префилл
     for req in newbies:
         if req.context_tokens_left == 0 and req.ttft_time is None:
@@ -351,7 +367,41 @@ def scheduler_step(
     accelerator.is_ticking = True
 
 
-def simulate(N, df):
+def scheduler_step(
+    time_now: float, 
+    deque_requests: Deque[Request], 
+    accelerator: Accelerator, 
+    scheduler_event: List[Event], 
+    completed_requests: List[Request]
+) -> None:
+    """
+    Главный оркестратор (планировщик) симуляции. Управляет симуляцией запросов на GPU: 
+    очищает завершенные, добирает новые из очереди и запускает вычисления такта.
+    
+    time_now - текущее время симуляции
+    deque_requests - очередь ожидающих запросов
+    accelerator - экземпляр текущей видеокарты
+    scheduler_event - куча (heapq) будущих событий
+    completed_requests - список успешно выполненных запросов
+    """
+    
+    #  Очистка готовых
+    collect_finished_requests(time_now, accelerator, completed_requests)
+    
+    # Добор новых 
+    admit_new_requests(deque_requests, accelerator)
+
+    # Если батч пуст - выключаем GPU
+    if not accelerator.active_batch:
+        accelerator.is_ticking = False
+        return
+
+    # 3. Управление памяти, расчет шага времени и планирование тика
+    process_compute_step(time_now, deque_requests, accelerator, scheduler_event)
+
+
+
+def simulate(N: int, df: pd.DataFrame):
     """
     df - наши логи
     N - количество гпу
@@ -403,28 +453,27 @@ def simulate(N, df):
                             completed_requests,
                         )
 
-    return True, completed_requests
+    return True, completed_requests, list_accelerators
 
+
+
+"""Теперь сбор статистики с симуляции, где ПОСЧИТАНО где и что справилось неверно"""
+#  либо кусочек
+M = 500
+df_ = df.head(M)
+# либо весь дф
+# df_ = df 
 
 find_necessary_N = 0
 success_requests = []
 
-# M = 1705
-# df_ = df.head(M)
-df_ = df
 
-"""Теперь сбор статистики с симуляции, где ПОСЧИТАНО где и что справилось неверно"""
-
-list_sum_all_time_stages = []  # НАБОР T
-list_samples_ttft = []  # НАБОР TTFT ДЛЯ КАЖДОГО ЛОГА
-for req in success_requests:
-    list_sum_all_time_stages.append(req.finish_time - req.time_to_come)
-    list_samples_ttft.append(req.ttft_time - req.time_to_come)
-
-
-def run_analytics(N, df_sample):
-
-    success, completed_requests = simulate(N, df_sample.copy())
+def run_analytics(N: int, df_sample: pd.DataFrame) -> None:
+    '''
+    тут просто запускаем симуляцию
+    и выводим статистику хитрых метрик =)
+    '''
+    success, completed_requests, accelerators = simulate(N, df_sample.copy())
 
     total_reqs = len(completed_requests)
     if total_reqs == 0:
@@ -476,7 +525,29 @@ def run_analytics(N, df_sample):
         print(f"P99: {np.percentile(decode_times, 99):.4f} сек")
         print(f"Максимум: {np.max(decode_times):.4f} сек")
 
-    # Базовая логика рекомендаций
+    actual_makespan = max(req.finish_time for req in completed_requests if req.finish_time is not None)
+
+    print("\n--- УТИЛИЗАЦИЯ И ПРОСТОЙ GPU (EMPIRICAL IDLE TIME) ---")
+    total_idle_cluster = 0
+    total_compute_cluster = 0
+
+    for acc in accelerators:
+        compute_time = acc.total_compute_time
+        idle_time = actual_makespan - compute_time
+        utilization = (compute_time / actual_makespan) * 100
+
+        total_idle_cluster += idle_time
+        total_compute_cluster += compute_time
+        # Можно раскомментировать, чтобы посмотреть каждую карту отдельно:
+        print(f"GPU {acc.gpu_id}: Утилизация {utilization:.1f}% | Работа: {compute_time:.1f}s | Простой: {idle_time:.1f}s")
+
+    avg_cluster_utilization = (total_compute_cluster / (actual_makespan * N)) * 100
+    print(f"Средняя загрузка кластера (Useful Compute): {avg_cluster_utilization:.2f}%")
+    total_cluster_capacity = actual_makespan * N
+
+    # Выводим корректное соотношение:
+    print(f"Суммарный простой кластера (Idle Time): {total_idle_cluster:,.2f} сек из общих {total_cluster_capacity:,.2f} машино-секунд")
+        # Базовая логика рекомендаций
     print("\n--- РЕКОМЕНДАЦИИ  --")
     if fail_rate == 0:
         print("Система работает идеально. Ресурсов достаточно.")
@@ -496,8 +567,5 @@ def run_analytics(N, df_sample):
                 " Рекомендация: Слишком большой батч на генерации, из-за чего падает скорость. Возможно, стоит уменьшить MAX_CHUNK_SIZE или увеличить вычислительную мощность (COST_C)."
             )
 
-
-# Запускаем, например, для N=1 и N=2, чтобы сравнить статистику
-# run_analytics(N=1, df_sample=df_)
-# run_analytics(N=2, df_sample=df_)
-run_analytics(N=15, df_sample=df_)
+# пример рассчета. Оптимальное количество рассчитывается в файле min_gpu_for_azure_logs.ipynd
+run_analytics(N=11, df_sample=df_)
