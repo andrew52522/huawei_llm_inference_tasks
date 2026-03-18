@@ -2,6 +2,7 @@ import heapq
 import math
 from collections import deque
 
+import numpy as np
 import pandas as pd
 
 # gzip по расширению
@@ -9,10 +10,12 @@ df = pd.read_csv("trace.csv.gz", compression="gzip")
 
 
 # Глобальные константы. взяли всего одну GPU,
-# где N = 1, K = ??? не указали, но надо
-MEM_M = 800000  # mb   1000 MB ~ 1GB
 
-MEM_X = 50  # вес самой картинки 1024px+ + weights для самой модели детекцим
+MEM_M = 80000  # 80 gb memory
+MEM_MODEL_TEXT_EXTRACTION = 600  # MB  weights для самой модели детекцим
+MEM_M -= MEM_MODEL_TEXT_EXTRACTION
+
+MEM_X = 10  # вес самой картинки 1024px
 MEM_Y = 1  # мб на 1 токен контекста (входной текст)
 MEM_Z = 1  # мб на 1 сгенерированный токен ( выходной текст)
 # ТОКЕНЫ контекста и генерации разные вещи и хранятся в VRAM
@@ -23,16 +26,18 @@ COST_B = 0.01  # обработка 1 токена контекста
 COST_C = 0.05  # 1 сгенерированный токен
 
 # limitations global contants
-LIM_TTFT = 500  # P ttft not more P
-LIM_GEN_NEXT_TOK = 500  # D limit time stage 3 0.05 это sec/token
+LIM_TTFT = 10  # P ttft not more P
+LIM_GEN_NEXT_TOK = 1  # D limit time stage 3 0.05 это sec/token
 
-MAX_CHUNK_SIZE = 512  # tokens per forward pass
+MAX_CHUNK_SIZE = 512  # tokens per forward pass # 512
+MAX_BATCH_SIZE = 20  # сколько в батч задвинем реквестов
 
 
 class Request:
     """
     Поля: id, время_прибытия, кол_во_картинок, токены_контекста, токены_генерации
     То что содержится в классе:
+    id - запроса
     start_processing_time - время когда gpu только НАЧАЛА работать
     ttft_time - закончился препроцессинг картинок и контекста
     finish_time - время сгенерированного последнего токена, который должен <= T (по ТЗ)
@@ -64,6 +69,7 @@ class Request:
         self.finish_time = None
         self.limit_failed = False
         self.time_stage_3 = None
+        self.fail_reason = None
 
     def get_memory_per_request(self):
         """
@@ -80,10 +86,10 @@ class Request:
 class Accelerator:
     """
     класс GPU c характеристиками
-    статус (Свободен/Занят), доступная_память, вычислительная_мощность
+    статус (Свободен/Занят), доступная_память, вычислительная_мощность, номер_гпу
     """
 
-    def __init__(self, status, memory, computing):
+    def __init__(self, status, memory, computing, gpu_id):
         self.status = status
         self.free_memory = MEM_M
         self.computing = computing
@@ -91,6 +97,7 @@ class Accelerator:
         self.is_ticking = (
             False  # это флаг того, что если загрузится гпу, то она в работе
         )
+        self.gpu_id = gpu_id
 
 
 class Event:
@@ -148,21 +155,30 @@ def make_heap_from_df(df):
 
 def check_limitations(req):
     """
-    раньше аргументы req
-    ttft_duration = req.ttft_time - req.time_to_come
-    time_per_token = time_stage_3 / max_gen_tokens
-    if ttft_duration > LIM_TTFT or time_per_token > LIM_GEN_NEXT_TOK:
-      req.limit_failed = True
-    """
-    # проверка на TTFT -в ttft_time там время префилл + time_to_come +
-    if (req.ttft_time - req.time_to_come) > LIM_TTFT:
-        req.limit_failed = True
+    проверка sla с подробным логированием
 
-    total_stage_3_time = req.finish_time - req.ttft_time
-    average_time_per_token = total_stage_3_time / req.token_generation
-    # проверка на лимит D
-    if average_time_per_token > LIM_GEN_NEXT_TOK:
+    """
+    ttft_duration = req.ttft_time - req.time_to_come
+    average_time_per_token = 0.0
+
+    print(
+        f"[LOG SLA CHECK] Req {req.id}: TTFT = {ttft_duration:.2f}s (Limit {LIM_TTFT}) | "
+        f"Decode Avg = {average_time_per_token:.4f}s (Limit {LIM_GEN_NEXT_TOK}) | "
+        f"Gen Tokens = {req.token_generation}"
+    )
+    if ttft_duration > LIM_TTFT:
         req.limit_failed = True
+        req.fail_reason = "TTFT"
+        print(f"   -----> [SLA FAILED] REQ {req.id}: ПРЕВЫШЕН ЛИМИТ TTFT!")
+    if req.token_generation > 0:
+        total_stage_3_time = req.finish_time - req.ttft_time
+        average_time_per_token = total_stage_3_time / req.token_generation
+        if average_time_per_token > LIM_GEN_NEXT_TOK:
+            req.limit_failed = True
+            req.fail_reason = "DECODE"
+            print(
+                f" ----> [SLA FAILED] REQ {req.id}: ПРЕВЫШЕН ЛИМИТ ГЕНЕРАЦИИ НА ТОКЕН"
+            )
 
 
 """
@@ -172,48 +188,59 @@ def check_limitations(req):
 но можно и больше - это гиперпараметр
 """
 
+"""
+17 марта чиню багу на sla
+upd оказалось неправильно рассчитывал эвристику параллелизма
+поэтому всегда вываливалось за лимиты и помогли логи
+
+18 марта ошибка после 701 deadlock - была утечка призрачной памяти
+нужно чтоб req не был в active_batch
+
+получился рабочий код при не щадящих ограничених 
+потом код ложился на определенных логах, где generatedcontext == 0
+"""
+
 
 def scheduler_step(
     time_now, deque_requests, accelerator, scheduler_event, completed_requests
 ):
-    # очистка завершенных в батче
+
     finished_requests = []
 
     for req in accelerator.active_batch:
-        # случай когда все догенерилось
-        if req.tokens_left_to_generate == 0:
+        if req.tokens_left_to_generate == 0 and req.ttft_time is not None:
             req.finish_time = time_now
             req.time_stage_3 = req.finish_time - req.ttft_time
             accelerator.free_memory += req.allocated_vram
             check_limitations(req)
             finished_requests.append(req)
 
-    # теперь надо  из активного батча выкинуть завершенные через множества
-    # и с охранением порядка
     finished_set = set(finished_requests)
     completed_requests.extend(finished_requests)
     accelerator.active_batch = [
         req for req in accelerator.active_batch if req not in finished_set
     ]
 
-    # Continious Batching in flight если есть что-то в очереди и слезет в память
+    # Дозаполнение батча (Continuous Batching)
     while deque_requests:
+        # --- ПРЕДОХРАНИТЕЛЬ: Ограничение  батча ---
+        if len(accelerator.active_batch) >= MAX_BATCH_SIZE:
+            break
+
         next_req = deque_requests[0]
         tokens_for_first_chunk = min(MAX_CHUNK_SIZE, next_req.token_context)
         initial_mem_needed = (next_req.num_images * MEM_X) + (
             tokens_for_first_chunk * MEM_Y
         )
 
-        # ПРЕДОХРАНИТЕЛЬ ОТ ОТРАВЛЕННЫХ ЗАПРОСОВ
         if initial_mem_needed > MEM_M:
-            deque_requests.popleft()  # Выкидываем запрос, он физически не влезет
+            deque_requests.popleft()
             continue
 
         if initial_mem_needed <= accelerator.free_memory:
             req = deque_requests.popleft()
             accelerator.active_batch.append(req)
 
-            # СРАЗУ бронируем память и под картинки, И под первый чанк префилла!
             img_mem = req.images_left * MEM_X
             chunk_mem = tokens_for_first_chunk * MEM_Y
 
@@ -221,37 +248,39 @@ def scheduler_step(
             accelerator.free_memory -= total_reserved
             req.allocated_vram += total_reserved
 
+            # Обнуляем картинки, так как память под них выделена
             req.images_left = 0
-            # И сразу отнимаем токены из контекста, так как мы их забронировали
-            req.context_tokens_left -= tokens_for_first_chunk
-
+            # req.context_tokens_left -= tokens_for_first_chunk
         else:
-            # не хватка памяти
             break
 
-    # GPU ate batch
+    # Если батч пуст - выключаем GPU
     if not accelerator.active_batch:
         accelerator.is_ticking = False
         return
 
-    # вычисление следующего такта (tick)
-    B_size = len(accelerator.active_batch)
-    # те кто не прошел prefill
-    # CHUNKED PREFILL
+    #  Распределение на Newbies (Prefill) и Decoders (Генерация)
     newbies = [i for i in accelerator.active_batch if i.ttft_time is None]
+    # Защита от "путешествий во времени" (запрос становится декодером только когда настало его время)
     decoders = [k for k in accelerator.active_batch if k.ttft_time is not None]
 
-    step_time = 0
+    current_chunk_tokens = 0
+    current_images_to_process = 0
+    processed_decoders = 0
 
-    # prefilling newbies if they exist
+    # Обработка Prefill
     if newbies:
-        current_chunk_tokens = 0
-
         for req in newbies:
-            tokens_to_compute = min(
-                req.context_tokens_left + MAX_CHUNK_SIZE, MAX_CHUNK_SIZE
-            )
+            # Считаем картинки только один раз (когда контекст еще целый)
+            if getattr(req, "images_processed", False) is False:
+                current_images_to_process += req.num_images
+                req.images_processed = True
+
+            #  берем остаток токенов, но не больше чанка
+            tokens_to_compute = min(req.context_tokens_left, MAX_CHUNK_SIZE)
             current_chunk_tokens += tokens_to_compute
+            # списываем токены, которые взяли в вычисление
+            req.context_tokens_left -= tokens_to_compute
 
             if req.context_tokens_left > 0:
                 next_chunk = min(req.context_tokens_left, MAX_CHUNK_SIZE)
@@ -265,82 +294,61 @@ def scheduler_step(
             if current_chunk_tokens >= MAX_CHUNK_SIZE:
                 break
 
-        processed_decoders = 0
-        for req in decoders:
-            while accelerator.free_memory < MEM_Z:
-                victim_req = max(
-                    accelerator.active_batch, key=lambda r: r.tokens_left_to_generate
-                )
+    # Обработка Decode EVICTION POLICY
+    for req in decoders:
+        # защита от утечки памяти
+        if req not in accelerator.active_batch:
+            continue
 
-                if (
-                    victim_req is req
-                    or victim_req.tokens_left_to_generate <= req.tokens_left_to_generate
-                ):
-                    break
+        while accelerator.free_memory < MEM_Z:
+            victim_req = max(
+                accelerator.active_batch, key=lambda r: r.tokens_left_to_generate
+            )
+            if victim_req is req:
+                break
 
-                # выселяем
-                accelerator.free_memory += victim_req.allocated_vram
-                victim_req.allocated_vram = 0
-                victim_req.context_tokens_left = victim_req.token_context
-                victim_req.ttft_time = None
-                accelerator.active_batch.remove(victim_req)
-                deque_requests.appendleft(victim_req)
+            accelerator.free_memory += victim_req.allocated_vram
+            victim_req.allocated_vram = 0
+            victim_req.context_tokens_left = victim_req.token_context
+            victim_req.ttft_time = None
+            accelerator.active_batch.remove(victim_req)
+            deque_requests.appendleft(victim_req)
 
-            if accelerator.free_memory >= MEM_Z:
-                req.tokens_left_to_generate -= 1
-                accelerator.free_memory -= MEM_Z
-                req.allocated_vram += MEM_Z
-                processed_decoders += 1
+        if accelerator.free_memory >= MEM_Z:
+            req.tokens_left_to_generate -= 1
+            accelerator.free_memory -= MEM_Z
+            req.allocated_vram += MEM_Z
+            processed_decoders += 1
 
-        time_prefill = current_chunk_tokens * COST_B
-        time_decode = processed_decoders * COST_C
-        step_time = (time_prefill + time_decode) * math.sqrt(B_size)
+    time_images = (
+        COST_A * math.sqrt(current_images_to_process)
+        if current_images_to_process > 0
+        else 0
+    )
+    time_prefill = (
+        COST_B * math.sqrt(current_chunk_tokens) if current_chunk_tokens > 0 else 0
+    )
+    time_decode = (
+        COST_C * math.sqrt(processed_decoders) if processed_decoders > 0 else 0
+    )
 
-        for req in newbies:
-            if req.context_tokens_left == 0 and req.ttft_time is None:
-                req.ttft_time = time_now + step_time
-    else:
-        # нету новеньких
-        processed_decoders = 0
-        for req in decoders:
-            # Пытаемся освободить память, если ее нет
-            # EVICTION POLICY
-            while accelerator.free_memory < MEM_Z:
-                victim_req = max(
-                    accelerator.active_batch, key=lambda r: r.tokens_left_to_generate
-                )
+    step_time = time_images + time_prefill + time_decode
 
-                if (
-                    victim_req is req
-                    or victim_req.tokens_left_to_generate <= req.tokens_left_to_generate
-                ):
-                    break
+    # предохранитель от Deadlock
+    if step_time <= 0:
+        step_time = 0.001
 
-                accelerator.free_memory += victim_req.allocated_vram
-                victim_req.allocated_vram = 0
-                victim_req.context_tokens_left = victim_req.token_context
-                victim_req.ttft_time = None
+    # Назначаем TTFT тем, кто закончил префилл
+    for req in newbies:
+        if req.context_tokens_left == 0 and req.ttft_time is None:
+            req.ttft_time = time_now + step_time
 
-                accelerator.active_batch.remove(victim_req)
-                deque_requests.appendleft(victim_req)
-
-            # Если память есть (или мы ее освободили) - генерируем
-            if accelerator.free_memory >= MEM_Z:
-                req.tokens_left_to_generate -= 1
-                accelerator.free_memory -= MEM_Z
-                req.allocated_vram += MEM_Z
-                processed_decoders += 1
-
-        # время чистого декода
-        step_time = (processed_decoders * COST_C) * math.sqrt(B_size)
-
-        # создаем событие
-        # типо трансформер прошёл один forward pass
-        this_event = Event(
-            time_event=time_now + step_time, type_event="TICK_DONE", data=accelerator
-        )
-        heapq.heappush(scheduler_event, this_event)
-        accelerator.is_ticking = True
+    #  Создаем следующее событие (ТАКТ ВЫПОЛНЕН)
+    this_event = Event(
+        time_event=time_now + step_time, type_event="TICK_DONE", data=accelerator
+    )
+    heapq.heappush(scheduler_event, this_event)
+    accelerator.is_ticking = True
 
 
 def simulate(N, df):
@@ -349,7 +357,7 @@ def simulate(N, df):
     N - количество гпу
     """
     time_now = 0
-    list_accelerators = [Accelerator("FREE ACCELERATOR", MEM_M, 1) for i in range(N)]
+    list_accelerators = [Accelerator("FREE ACCELERATOR", MEM_M, 1, i) for i in range(N)]
 
     deque_requests = deque()
     completed_requests = []  # успешно завершенные запросы
@@ -362,6 +370,9 @@ def simulate(N, df):
         time_now = this_event.time_event
 
         if this_event.type_event == "NEW REQUEST":
+            print(
+                f"\n[LOG TIME: {time_now:.2f}] Новый запрос в систему: Req {this_event.data.id} (INPUT_TOK: {this_event.data.token_context}, GEN_TOK: {this_event.data.token_generation})"
+            )
             deque_requests.append(this_event.data)
             # Убрали цикл for acc in list_accelerators отсюда, перенесли вниз
 
@@ -380,13 +391,17 @@ def simulate(N, df):
         if deque_requests:
             for acc in list_accelerators:
                 if not acc.is_ticking:
-                    scheduler_step(
-                        time_now,
-                        deque_requests,
-                        acc,
-                        scheduler_event,
-                        completed_requests,
-                    )
+                    if len(deque_requests) > 0:
+                        print(
+                            f"[LOG TIME: {time_now:.2f}] Будильник активировал свободную GPU {acc.gpu_id}"
+                        )
+                        scheduler_step(
+                            time_now,
+                            deque_requests,
+                            acc,
+                            scheduler_event,
+                            completed_requests,
+                        )
 
     return True, completed_requests
 
@@ -394,29 +409,11 @@ def simulate(N, df):
 find_necessary_N = 0
 success_requests = []
 
-M = 500
-df_ = df.head(M)
-print(f" M = {M}")
-for i in range(1, 100):
-    print(f"симулируем для количества карточек N = {i}")
-    success, current_completed_requests = simulate(
-        i, df_.copy()
-    )  # берем результат из функции
+# M = 1705
+# df_ = df.head(M)
+df_ = df
 
-    flag_sla = False
-    for req in current_completed_requests:  # проверяем именно этот запуск
-        if req.limit_failed:
-            flag_sla = True
-            print("Noooo, ne poluchilos")
-            break
-
-    if not flag_sla and len(current_completed_requests) > 0:  # ПРЕДОХРАНИТЕЛЬ
-        find_necessary_N = i
-        success_requests = current_completed_requests
-        print(f"Победа! Минимальное N = {i}")
-        break  # обязательно выходим, мы нашли минимум
-
-"""Теперь сбор статистики с симуляции, где мощей гпу хватило"""
+"""Теперь сбор статистики с симуляции, где ПОСЧИТАНО где и что справилось неверно"""
 
 list_sum_all_time_stages = []  # НАБОР T
 list_samples_ttft = []  # НАБОР TTFT ДЛЯ КАЖДОГО ЛОГА
@@ -424,20 +421,83 @@ for req in success_requests:
     list_sum_all_time_stages.append(req.finish_time - req.time_to_come)
     list_samples_ttft.append(req.ttft_time - req.time_to_come)
 
-print(list_samples_ttft)
-print(list_sum_all_time_stages)
 
-import statistics
+def run_analytics(N, df_sample):
 
-if find_necessary_N > 0:
-    print("\n--- TTFT (Time To First Token) ---")
-    print(f"Минимум: {min(list_samples_ttft):.2f} сек")
-    print(f"Максимум: {max(list_samples_ttft):.2f} сек")
-    print(f"Среднее: {statistics.mean(list_samples_ttft):.2f} сек")
-    print(f"Медиана: {statistics.median(list_samples_ttft):.2f} сек")
+    success, completed_requests = simulate(N, df_sample.copy())
 
-    print("\n--- TOTAL TIME FROM REQUEST TO FULL RESPONSE ---")
-    print(f"Минимум: {min(list_sum_all_time_stages):.2f} сек")
-    print(f"Максимум: {max(list_sum_all_time_stages):.2f} сек")
-    print(f"Среднее: {statistics.mean(list_sum_all_time_stages):.2f} сек")
-    print(f"Медиана: {statistics.median(list_sum_all_time_stages):.2f} сек")
+    total_reqs = len(completed_requests)
+    if total_reqs == 0:
+        print("Симуляция не вернула ни одного запроса.")
+        return
+
+    failed_reqs = [req for req in completed_requests if req.limit_failed]
+    failed_count = len(failed_reqs)
+    fail_rate = (failed_count / total_reqs) * 100
+
+    print(f"\n{'=' * 50}")
+    print(f"ЗАПУСК СИМУЛЯЦИИ: N (Кол-во GPU) = {N}")
+    print(f"ПЕРВЫЕ M логов: = {M}")
+    print(f"MAX_CHUNK_SIZE: = {MAX_CHUNK_SIZE}")
+    print(f"MAX_BATCH_SIZE = {MAX_BATCH_SIZE} сколько макс рекв в батч")
+    print(f"{'=' * 50}")
+
+    print("\n--- БАЗОВАЯ СТАТИСТИКА ---")
+    print(f"Всего запросов обработано: {total_reqs}")
+    print(f"Провалено по SLA: {failed_count} ({fail_rate:.2f}%)")
+
+    # Собираем сырые данные для перцентилей
+    ttft_times = [
+        (req.ttft_time - req.time_to_come)
+        for req in completed_requests
+        if req.ttft_time is not None
+    ]
+    decode_times = [
+        (req.time_stage_3 / req.token_generation)
+        for req in completed_requests
+        if req.finish_time is not None and req.token_generation > 0
+    ]
+
+    if ttft_times:
+        print("\n--- АНАЛИТИКА TTFT (Time To First Token) ---")
+        print(f"Лимит SLA (P): {LIM_TTFT} сек")
+        print(f"Среднее: {np.mean(ttft_times):.4f} сек")
+        print(f"Медиана (P50): {np.percentile(ttft_times, 50):.4f} сек")
+        print(f"P90: {np.percentile(ttft_times, 90):.4f} сек")
+        print(f"P99: {np.percentile(ttft_times, 99):.4f} сек")
+        print(f"Максимум: {np.max(ttft_times):.4f} сек")
+
+    if decode_times:
+        print("\n--- АНАЛИТИКА DECODE (Время на 1 токен генерации) ---")
+        print(f"Лимит SLA (D): {LIM_GEN_NEXT_TOK} сек")
+        print(f"Среднее: {np.mean(decode_times):.4f} сек")
+        print(f"Медиана (P50): {np.percentile(decode_times, 50):.4f} сек")
+        print(f"P90: {np.percentile(decode_times, 90):.4f} сек")
+        print(f"P99: {np.percentile(decode_times, 99):.4f} сек")
+        print(f"Максимум: {np.max(decode_times):.4f} сек")
+
+    # Базовая логика рекомендаций
+    print("\n--- РЕКОМЕНДАЦИИ  ---")
+    if fail_rate == 0:
+        print("Система работает идеально. Ресурсов достаточно.")
+    else:
+        # Пытаемся понять, где узкое горлышко
+        ttft_fails = sum(1 for t in ttft_times if t > LIM_TTFT)
+        decode_fails = sum(1 for d in decode_times if d > LIM_GEN_NEXT_TOK)
+
+        if ttft_fails > decode_fails:
+            print(" Диагноз: Проблема на этапе Prefill (превышен TTFT).")
+            print(
+                " Рекомендация: Запросы слишком долго ждут в очереди. Необходимо увеличить количество GPU (N)."
+            )
+        else:
+            print("Диагноз: Проблема на этапе Decode (долгая генерация).")
+            print(
+                " Рекомендация: Слишком большой батч на генерации, из-за чего падает скорость. Возможно, стоит уменьшить MAX_CHUNK_SIZE или увеличить вычислительную мощность (COST_C)."
+            )
+
+
+# Запускаем, например, для N=1 и N=2, чтобы сравнить статистику
+# run_analytics(N=1, df_sample=df_)
+# run_analytics(N=2, df_sample=df_)
+run_analytics(N=15, df_sample=df_)
