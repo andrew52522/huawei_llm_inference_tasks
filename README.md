@@ -35,6 +35,8 @@ task_huawei.py: The core simulation engine. It contains the Request, Accelerator
 
 min_gpu_for_azure_logs2.ipynb: The analytics and research pipeline. For algorithm Chunked Prefill and Continious Batching I get by GridSearch optimum parametrs.
 
+reluts.pdf: only results from .ipynd file
+
 Extracts the peak load window (e.g., Day 2, 16:00-17:30) to stress-test the system.
 
 Runs a 3D Grid Search (N GPUs x Chunk Size x Batch Size) to empirically find the minimal cluster size.
