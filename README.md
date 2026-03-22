@@ -31,6 +31,8 @@ Eviction Policy: A safety mechanism against OOM (Out-of-Memory). If VRAM runs ou
 
 sglang_summary_task1.pdf: my summary of paper Sglang
 
+Sglang vs vLLM.ipynb: comparacy benchmarks of vLLM and SGlang. Model - Qwen3.5-4B
+
 task_huawei.py: The core simulation engine. It contains the Request, Accelerator, and Event classes. The scheduler_step has been refactored into clean, typed, and fully documented private functions.
 
 min_gpu_for_azure_logs2.ipynb: The analytics and research pipeline. For algorithm Chunked Prefill and Continious Batching I get by GridSearch optimum parametrs.
