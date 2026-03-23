@@ -31,7 +31,7 @@ Eviction Policy: A safety mechanism against OOM (Out-of-Memory). If VRAM runs ou
 
 sglang_summary_task1.pdf: my summary of paper Sglang
 
-Sglang vs vLLM.ipynb: comparacy benchmarks of vLLM and SGlang. Model - Qwen3.5-4B
+Sglang_key_features_and_quantization_qwens.ipynb: Showing how fast SGlang, demostrated FSM, RadixTree + KV_cache, and afterall I quantizaied qwen2.5-36B-instruct and qwen2.5-7b-instruct both to float8
 
 task_huawei.py: The core simulation engine. It contains the Request, Accelerator, and Event classes. The scheduler_step has been refactored into clean, typed, and fully documented private functions.
 
