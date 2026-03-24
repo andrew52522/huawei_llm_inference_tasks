@@ -29,20 +29,21 @@ Eviction Policy: A safety mechanism against OOM (Out-of-Memory). If VRAM runs ou
 
 #### Repository Structure
 
-* 'sglang_summary_task1.pdf ': my summary of paper Sglang
+* `summary.pdf `: my summary of paper Sglang
 
-Sglang_key_features_and_quantization_qwens.ipynb: Showing how fast SGlang, demostrated FSM, RadixTree + KV_cache, and afterall I quantizaied qwen2.5-36B-instruct and qwen2.5-7b-instruct both to float8
+* `Sglang_key_features_and_quantization_qwens.ipynb `: Showing how fast SGlang, demostrated FSM, RadixTree + KV_cache, and afterall I quantizaied qwen2.5-36B-instruct and qwen2.5-7b-instruct both to float8
 
-Sglang_key_features_and_quantization_qwens.pdf : pdf file, because .ipynd isn`t show in github web 
+* `task_huawei.py `: The core simulation engine. It contains the Request, Accelerator, and Event classes. The scheduler_step has been refactored into clean, typed, and fully documented private functions.
 
-task_huawei.py: The core simulation engine. It contains the Request, Accelerator, and Event classes. The scheduler_step has been refactored into clean, typed, and fully documented private functions.
-
-min_gpu_for_azure_logs2.ipynb: The analytics and research pipeline. For algorithm Chunked Prefill and Continious Batching I get by GridSearch optimum parametrs.
-
-reluts.pdf: only results from .ipynd file
-
+* `min_gpu_for_azure_logs2.ipynb `: The analytics and research pipeline. For algorithm Chunked Prefill and Continious Batching I get by GridSearch optimum parametrs.
 Extracts the peak load window (e.g., Day 2, 16:00-17:30) to stress-test the system.
 
 Runs a 3D Grid Search (N GPUs x Chunk Size x Batch Size) to empirically find the minimal cluster size.
 
 Calculates the Theoretical Bounds (Best Case vs. Worst Case processing times) to validate the efficiency of the Continuous Batching algorithm.
+
+* `reluts_task2.pdf `: only results from .ipynd file
+
+* `GPU_PARAMETERES_AND_LIMITATIONS.png`: My answer N gpu outcomes from this gpu specs and limitations
+
+
